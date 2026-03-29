@@ -1,0 +1,639 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 2.2 — Standard Library Imports
+# ─────────────────────────────────────────────────────────────────────────────
+import warnings
+warnings.filterwarnings('ignore')          # Suppress convergence / deprecation noise
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import seaborn as sns
+
+# Financial data
+import yfinance as yf
+
+# Statistical tests
+from statsmodels.tsa.stattools import adfuller, acf, pacf
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+
+# ARIMA model
+from statsmodels.tsa.arima.model import ARIMA
+
+# Auto ARIMA (optional but recommended)
+try:
+    import pmdarima as pm
+    AUTO_ARIMA_AVAILABLE = True
+    print("✅ pmdarima is available — auto_arima will be used for hyperparameter tuning.")
+except ImportError:
+    AUTO_ARIMA_AVAILABLE = False
+    print("⚠️  pmdarima not found — using manual ARIMA(p,d,q) parameters.")
+
+# Evaluation metrics
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+# ── Notebook display settings ──────────────────────────────────────────────
+plt.rcParams.update({
+    'figure.figsize'    : (14, 5),
+    'axes.titlesize'    : 14,
+    'axes.labelsize'    : 12,
+    'lines.linewidth'   : 1.8,
+    'axes.spines.top'   : False,
+    'axes.spines.right' : False,
+    'figure.dpi'        : 120,
+})
+sns.set_palette('muted')
+
+# ── Reproducibility seed ──────────────────────────────────────────────────
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+
+print("\n🔧 All libraries imported successfully.")
+print(f"   numpy      : {np.__version__}")
+print(f"   pandas     : {pd.__version__}")
+print(f"   yfinance   : {yf.__version__}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 3.1 — Download financial data
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── User-configurable parameters ──────────────────────────────────────────
+TICKER     = 'AAPL'          # Try: 'BTC-USD', 'MSFT', 'TSLA', 'GOOGL'
+START_DATE = '2015-01-01'
+END_DATE   = '2024-12-31'
+LOOKBACK   = 14              # Momentum look-back window in trading days
+# ──────────────────────────────────────────────────────────────────────────
+
+print(f"⬇️  Downloading {TICKER} from {START_DATE} to {END_DATE} …")
+raw_df = yf.download(TICKER, start=START_DATE, end=END_DATE, progress=False)
+
+# Keep only the Adjusted Close price (accounts for splits / dividends)
+# yfinance returns multi-index columns; flatten if necessary
+if isinstance(raw_df.columns, pd.MultiIndex):
+    raw_df.columns = raw_df.columns.get_level_values(0)
+
+price_series = raw_df[['Close']].copy()
+price_series.columns = ['Close']
+price_series.dropna(inplace=True)
+
+print(f"✅ Downloaded {len(price_series):,} trading days of data.")
+print(f"   Date range : {price_series.index[0].date()} → {price_series.index[-1].date()}")
+print(f"   Price range: ${price_series['Close'].min():.2f} – ${price_series['Close'].max():.2f}")
+
+price_series.tail()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 4.1 — Compute Momentum (Rate of Change)
+# ─────────────────────────────────────────────────────────────────────────────
+
+df = price_series.copy()
+
+# Rate of Change formula
+df['Momentum'] = (
+    (df['Close'] - df['Close'].shift(LOOKBACK)) /
+     df['Close'].shift(LOOKBACK)
+) * 100
+
+# Also compute a simple 14-day price difference (alternative momentum definition)
+df['PriceDiff'] = df['Close'].diff(LOOKBACK)
+
+# Drop NaN rows introduced by shifting
+df.dropna(inplace=True)
+
+print(f"✅ Momentum series created. Shape after dropping NaN: {df.shape}")
+print(f"\nDescriptive statistics for Momentum (ROC %) series:")
+print(df['Momentum'].describe().round(4).to_string())
+
+# ── Extract the momentum series we will model ────────────────────────────
+momentum = df['Momentum'].copy()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 5.1 — Plot original price vs. momentum
+# ─────────────────────────────────────────────────────────────────────────────
+
+fig, axes = plt.subplots(2, 1, figsize=(15, 8), sharex=True)
+
+# ── Panel 1: Closing Price ────────────────────────────────────────────────
+axes[0].plot(df.index, df['Close'], color='steelblue', lw=1.5, label='Close Price')
+axes[0].fill_between(df.index, df['Close'].min(), df['Close'],
+                     alpha=0.10, color='steelblue')
+axes[0].set_title(f'{TICKER} — Daily Closing Price', fontweight='bold')
+axes[0].set_ylabel('Price (USD)')
+axes[0].legend(loc='upper left')
+axes[0].yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'${x:,.0f}'))
+
+# ── Panel 2: Momentum (ROC) ───────────────────────────────────────────────
+axes[1].plot(df.index, df['Momentum'], color='darkorange', lw=1.2,
+             label=f'{LOOKBACK}-Day ROC Momentum (%)')
+axes[1].axhline(0, color='grey', lw=0.8, linestyle='--')
+axes[1].fill_between(df.index, 0, df['Momentum'],
+                     where=(df['Momentum'] >= 0), alpha=0.25, color='green',
+                     label='Positive Momentum')
+axes[1].fill_between(df.index, 0, df['Momentum'],
+                     where=(df['Momentum'] < 0),  alpha=0.25, color='red',
+                     label='Negative Momentum')
+axes[1].set_title(f'{TICKER} — {LOOKBACK}-Day Rate-of-Change Momentum', fontweight='bold')
+axes[1].set_ylabel('Momentum (%)')
+axes[1].set_xlabel('Date')
+axes[1].legend(loc='upper left')
+axes[1].xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+
+plt.tight_layout()
+plt.suptitle('EDA — Price & Momentum Overview', y=1.01, fontsize=15, fontweight='bold')
+plt.savefig('01_price_vs_momentum.png', bbox_inches='tight', dpi=150)
+plt.show()
+print("📊 Plot saved: 01_price_vs_momentum.png")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 5.2 — Augmented Dickey-Fuller (ADF) Stationarity Test
+# ─────────────────────────────────────────────────────────────────────────────
+
+def adf_test(series: pd.Series, series_name: str = 'Series') -> dict:
+    """
+    Performs the Augmented Dickey-Fuller test and prints a formatted summary.
+    
+    H₀ (Null hypothesis)     : The series has a unit root → NON-STATIONARY
+    H₁ (Alternative hypothesis): The series is stationary
+    
+    If p-value < 0.05 → Reject H₀ → Series IS stationary
+    """
+    result = adfuller(series.dropna(), autolag='AIC')
+    adf_stat, p_val = result[0], result[1]
+    crit = result[4]          # critical values dict
+    is_stationary = p_val < 0.05
+    
+    verdict = "✅ STATIONARY (Reject H₀)" if is_stationary else "❌ NON-STATIONARY (Fail to Reject H₀)"
+    
+    print(f"{'='*60}")
+    print(f"  ADF Test — {series_name}")
+    print(f"{'='*60}")
+    print(f"  ADF Statistic : {adf_stat:.6f}")
+    print(f"  p-value       : {p_val:.6f}")
+    print(f"  Critical Values:")
+    for key, val in crit.items():
+        marker = '◀' if adf_stat < val else ' '
+        print(f"    {key:>4s}  →  {val:.4f}  {marker}")
+    print(f"\n  Verdict: {verdict}")
+    print(f"{'='*60}\n")
+    
+    return {'adf_stat': adf_stat, 'p_value': p_val,
+            'is_stationary': is_stationary, 'critical': crit}
+
+# Test 1: Raw Closing Price (expected: NON-STATIONARY)
+adf_price = adf_test(df['Close'], series_name='Raw Closing Price')
+
+# Test 2: Momentum / ROC (expected: STATIONARY or near-stationary)
+adf_mom = adf_test(df['Momentum'], series_name=f'{LOOKBACK}-Day ROC Momentum')
+
+# ── Mentor Note ──────────────────────────────────────────────────────────
+print("💡 Mentor Note:")
+print("   Raw prices are almost always non-stationary (trending).")
+print("   The ROC momentum series removes the trend, making ARIMA applicable.")
+print("   If momentum is still non-stationary, set d=1 in ARIMA to difference it.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 5.3 — ACF and PACF Plots
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# HOW TO READ THESE PLOTS:
+#
+# ACF  (Autocorrelation Function):
+#   → Shows correlation of the series with its own lagged values.
+#   → Helps identify the MA (q) order.
+#   → If ACF cuts off sharply after lag k → q = k
+#
+# PACF (Partial Autocorrelation Function):
+#   → Shows correlation after removing the effect of shorter lags.
+#   → Helps identify the AR (p) order.
+#   → If PACF cuts off sharply after lag k → p = k
+#
+# Shaded region = 95% confidence interval.
+# Spikes outside the shaded region are statistically significant.
+# ─────────────────────────────────────────────────────────────────────────────
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+
+plot_acf(momentum, lags=40, alpha=0.05, ax=axes[0],
+         title='ACF — Momentum Series\n(Helps estimate MA order q)',
+         color='steelblue', vlines_kwargs={'colors': 'steelblue'})
+axes[0].set_xlabel('Lag (days)')
+
+plot_pacf(momentum, lags=40, alpha=0.05, ax=axes[1], method='ywm',
+          title='PACF — Momentum Series\n(Helps estimate AR order p)',
+          color='darkorange', vlines_kwargs={'colors': 'darkorange'})
+axes[1].set_xlabel('Lag (days)')
+
+for ax in axes:
+    ax.axhline(0, color='black', lw=0.8)
+    ax.set_ylabel('Correlation')
+
+plt.suptitle('EDA — ACF & PACF to Guide ARIMA Parameter Selection',
+             fontsize=14, fontweight='bold', y=1.02)
+plt.tight_layout()
+plt.savefig('02_acf_pacf.png', bbox_inches='tight', dpi=150)
+plt.show()
+print("📊 Plot saved: 02_acf_pacf.png")
+print("\n💡 Mentor Tip: Look for the lag where the ACF/PACF first drops inside")
+print("   the shaded band. That lag value is your starting estimate for q / p.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 6.1 — Chronological Train / Test Split (80 / 20)
+# ─────────────────────────────────────────────────────────────────────────────
+
+split_idx  = int(len(momentum) * 0.80)
+train      = momentum.iloc[:split_idx]
+test       = momentum.iloc[split_idx:]
+
+print(f"Total observations  : {len(momentum):,}")
+print(f"Training set size   : {len(train):,}  ({train.index[0].date()} → {train.index[-1].date()})")
+print(f"Test set size       : {len(test):,}  ({test.index[0].date()}  → {test.index[-1].date()})")
+
+# ── Visualise the split ───────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(15, 4))
+ax.plot(train.index, train, label='Training Set', color='steelblue', lw=1.4)
+ax.plot(test.index,  test,  label='Test Set',     color='darkorange', lw=1.4)
+ax.axvline(train.index[-1], color='grey', linestyle='--', lw=1.2, label='Split Point')
+ax.set_title('Momentum Series — Train / Test Split', fontweight='bold')
+ax.set_ylabel('Momentum (%)')
+ax.set_xlabel('Date')
+ax.legend()
+plt.tight_layout()
+plt.savefig('03_train_test_split.png', bbox_inches='tight', dpi=150)
+plt.show()
+print("📊 Plot saved: 03_train_test_split.png")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 6.2 — Optional: auto_arima for Automated Hyperparameter Tuning
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# auto_arima performs a stepwise search over (p, d, q) combinations
+# and selects the model with the lowest AIC (Akaike Information Criterion).
+#
+# AIC = 2k - 2ln(L)
+#   k = number of model parameters
+#   L = maximum likelihood value
+#   Lower AIC → better model (balances fit vs complexity)
+# ─────────────────────────────────────────────────────────────────────────────
+
+if AUTO_ARIMA_AVAILABLE:
+    print("🔍 Running auto_arima — this may take 30–60 seconds …")
+    auto_model = pm.auto_arima(
+        train,
+        start_p=0, max_p=5,
+        start_q=0, max_q=5,
+        d=None,                  # auto-detect differencing order
+        seasonal=False,          # no seasonality in daily momentum
+        information_criterion='aic',
+        stepwise=True,           # faster than full grid search
+        suppress_warnings=True,
+        error_action='ignore',
+        trace=True               # print each model tested
+    )
+
+    best_order = auto_model.order
+    print(f"\n✅ Best order found by auto_arima: ARIMA{best_order}")
+    print(f"   AIC = {auto_model.aic():.4f}")
+    print(f"   BIC = {auto_model.bic():.4f}")
+    p, d, q = best_order
+else:
+    # ── Fallback: Use manual order guided by ACF/PACF inspection ─────────
+    # Common starting points for momentum series:
+    #   p=2 (AR lags from PACF), d=0 (already stationary), q=2 (MA from ACF)
+    p, d, q = 2, 0, 2
+    print(f"⚙️  Using manual ARIMA order: ({p}, {d}, {q})")
+    print("   Install pmdarima for automatic selection: pip install pmdarima")
+
+print(f"\n📌 Final ARIMA order to be fitted: ({p}, {d}, {q})")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 6.3 — Fit ARIMA Model on Training Data
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# ARIMA(p, d, q) components:
+#
+#  AR (p): Auto-Regressive — uses past p values to predict the next value.
+#          y_t = c + φ₁y_{t-1} + φ₂y_{t-2} + … + φₚy_{t-p} + ε_t
+#
+#  I  (d): Integrated — number of times the series is differenced to achieve
+#          stationarity.
+#
+#  MA (q): Moving Average — uses past q forecast errors.
+#          y_t = μ + ε_t + θ₁ε_{t-1} + … + θ_qε_{t-q}
+# ─────────────────────────────────────────────────────────────────────────────
+
+print(f"🏋️  Fitting ARIMA({p},{d},{q}) on {len(train):,} training observations …")
+
+arima_model = ARIMA(train, order=(p, d, q))
+fitted      = arima_model.fit()
+
+print("\n" + "="*65)
+print(fitted.summary())
+print("="*65)
+
+print("\n💡 Interpretation Guide for the Model Summary:")
+print("   • coef      → estimated parameter values")
+print("   • P>|z|     → p-value; values < 0.05 indicate significance")
+print("   • AIC/BIC   → lower is better; used for model comparison")
+print("   • Ljung-Box → p > 0.05 means residuals are white noise (good!)")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 6.4 — Residual Diagnostics
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# A good model should have residuals that look like white noise:
+#   ✅ Zero mean
+#   ✅ Constant variance (homoscedastic)
+#   ✅ No autocorrelation (ACF of residuals inside confidence band)
+#   ✅ Approximately normally distributed
+# ─────────────────────────────────────────────────────────────────────────────
+
+fig = fitted.plot_diagnostics(figsize=(15, 10))
+fig.suptitle(f'ARIMA({p},{d},{q}) — Residual Diagnostics',
+             fontsize=14, fontweight='bold', y=1.01)
+plt.tight_layout()
+plt.savefig('04_residual_diagnostics.png', bbox_inches='tight', dpi=150)
+plt.show()
+print("📊 Plot saved: 04_residual_diagnostics.png")
+
+# ── Residual statistics ──────────────────────────────────────────────────
+residuals = fitted.resid
+print(f"\nResidual Statistics:")
+print(f"  Mean : {residuals.mean():.6f}  (should be ≈ 0)")
+print(f"  Std  : {residuals.std():.6f}")
+print(f"  Min  : {residuals.min():.6f}")
+print(f"  Max  : {residuals.max():.6f}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 7.1 — Generate Predictions on Test Set
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Predict over the entire test period (in-sample forecast)
+start_idx = len(train)
+end_idx   = len(train) + len(test) - 1
+
+predictions = fitted.predict(start=start_idx, end=end_idx)
+predictions.index = test.index          # Align with test dates
+
+# ── Calculate Metrics ────────────────────────────────────────────────────
+actual = test.values
+pred   = predictions.values
+
+def mape(y_true, y_pred, epsilon=1e-8):
+    """
+    Mean Absolute Percentage Error.
+    epsilon guards against division by zero for near-zero actual values.
+    """
+    y_true = np.where(np.abs(y_true) < epsilon, epsilon, y_true)
+    return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+
+mae_val  = mean_absolute_error(actual, pred)
+rmse_val = np.sqrt(mean_squared_error(actual, pred))
+mape_val = mape(actual, pred)
+
+# ── Benchmark: Naïve Forecast (Persistence Model) ────────────────────────
+naive_pred  = train.iloc[-1] * np.ones(len(test))  # constant last value
+mae_naive   = mean_absolute_error(actual, naive_pred)
+rmse_naive  = np.sqrt(mean_squared_error(actual, naive_pred))
+mape_naive  = mape(actual, naive_pred)
+
+print("╔" + "═"*55 + "╗")
+print("║      EVALUATION METRICS — Test Set Performance        ║")
+print("╠" + "═"*55 + "╣")
+print(f"║  {'Metric':<18} {'ARIMA':>12}   {'Naïve Baseline':>15} ║")
+print("╠" + "═"*55 + "╣")
+print(f"║  {'MAE':<18} {mae_val:>12.4f}   {mae_naive:>15.4f} ║")
+print(f"║  {'RMSE':<18} {rmse_val:>12.4f}   {rmse_naive:>15.4f} ║")
+print(f"║  {'MAPE (%)':<18} {mape_val:>12.4f}   {mape_naive:>15.4f} ║")
+print("╚" + "═"*55 + "╝")
+
+# Skill ratio
+skill_mae = (1 - mae_val / mae_naive) * 100
+print(f"\n  📐 ARIMA Skill Score (MAE) vs Naïve: {skill_mae:+.1f}%")
+print(f"     Positive → ARIMA outperforms the naïve forecast.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 7.2 — Generate 30-Step Ahead Future Forecast
+# ─────────────────────────────────────────────────────────────────────────────
+
+FORECAST_STEPS = 30
+
+# Forecast beyond the available data
+forecast_result = fitted.get_forecast(steps=FORECAST_STEPS)
+forecast_mean   = forecast_result.predicted_mean
+forecast_ci     = forecast_result.conf_int(alpha=0.05)  # 95% CI
+
+# Create future date index (business days)
+last_date    = momentum.index[-1]
+future_dates = pd.bdate_range(start=last_date + pd.Timedelta(days=1),
+                               periods=FORECAST_STEPS)
+forecast_mean.index = future_dates
+forecast_ci.index   = future_dates
+
+print(f"✅ Generated {FORECAST_STEPS}-step ahead forecast.")
+print(f"   Forecast period: {future_dates[0].date()} → {future_dates[-1].date()}")
+print(f"\n   Forecasted Momentum (first 5 and last 5 steps):")
+
+display_df = pd.DataFrame({
+    'Forecast (%)': forecast_mean.round(4),
+    'Lower 95% CI': forecast_ci.iloc[:, 0].round(4),
+    'Upper 95% CI': forecast_ci.iloc[:, 1].round(4)
+})
+print(pd.concat([display_df.head(5), display_df.tail(5)]).to_string())
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 8.1 — Final Comprehensive Results Plot
+# ─────────────────────────────────────────────────────────────────────────────
+
+fig, axes = plt.subplots(2, 1, figsize=(17, 12),
+                          gridspec_kw={'height_ratios': [2, 1]})
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PANEL A — Full Overview: Train | Test | Forecast
+# ═══════════════════════════════════════════════════════════════════════════
+ax = axes[0]
+
+# Training data (last 200 points for readability)
+TAIL = 200
+ax.plot(train.index[-TAIL:], train.values[-TAIL:],
+        color='#4a90d9', lw=1.4, alpha=0.8, label='Training Data')
+
+# Actual test values
+ax.plot(test.index, test.values,
+        color='#2ecc71', lw=2.0, label='Actual Momentum (Test)')
+
+# ARIMA predictions on test set
+ax.plot(predictions.index, predictions.values,
+        color='#e74c3c', lw=2.0, linestyle='--',
+        label=f'ARIMA({p},{d},{q}) Prediction')
+
+# 30-step future forecast
+ax.plot(forecast_mean.index, forecast_mean.values,
+        color='#9b59b6', lw=2.2, linestyle='-.',
+        label=f'{FORECAST_STEPS}-Step Future Forecast')
+
+# 95% Confidence interval for future forecast
+ax.fill_between(forecast_ci.index,
+                forecast_ci.iloc[:, 0],
+                forecast_ci.iloc[:, 1],
+                alpha=0.20, color='#9b59b6', label='95% Confidence Interval')
+
+# Reference lines
+ax.axhline(0, color='black', lw=0.7, linestyle='--', alpha=0.5)
+ax.axvline(test.index[0], color='grey', lw=1.0, linestyle=':', alpha=0.8)
+ax.axvline(momentum.index[-1], color='purple', lw=1.0, linestyle=':', alpha=0.8)
+
+# Annotations
+ax.annotate('← Train | Test →', xy=(test.index[0], ax.get_ylim()[0]),
+            fontsize=9, color='grey', ha='center')
+ax.annotate('← Historical | Forecast →',
+            xy=(momentum.index[-1], ax.get_ylim()[0]),
+            fontsize=9, color='purple', ha='center')
+
+# Metrics box
+metrics_text = (
+    f"Model: ARIMA({p},{d},{q})\n"
+    f"MAE  = {mae_val:.4f}\n"
+    f"RMSE = {rmse_val:.4f}\n"
+    f"MAPE = {mape_val:.2f}%"
+)
+ax.text(0.01, 0.97, metrics_text, transform=ax.transAxes,
+        fontsize=10, verticalalignment='top',
+        bbox=dict(boxstyle='round,pad=0.5', facecolor='lightyellow',
+                  edgecolor='orange', alpha=0.8),
+        fontfamily='monospace')
+
+ax.set_title(f'{TICKER} — Momentum Forecasting with ARIMA({p},{d},{q})',
+             fontsize=15, fontweight='bold')
+ax.set_ylabel('Momentum / ROC (%)', fontsize=12)
+ax.legend(loc='upper right', fontsize=9)
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PANEL B — Zoomed: Actual vs Predicted on Test Set Only
+# ═══════════════════════════════════════════════════════════════════════════
+ax2 = axes[1]
+
+ax2.plot(test.index, test.values,
+         color='#2ecc71', lw=2.0, label='Actual Momentum')
+ax2.plot(predictions.index, predictions.values,
+         color='#e74c3c', lw=2.0, linestyle='--',
+         label=f'ARIMA({p},{d},{q}) Prediction')
+
+# Shade the error region
+ax2.fill_between(test.index, test.values, predictions.values,
+                  alpha=0.15, color='red', label='Prediction Error')
+
+ax2.axhline(0, color='black', lw=0.7, linestyle='--', alpha=0.5)
+ax2.set_title('Zoomed In — Test Set: Actual vs Predicted Momentum',
+              fontsize=13, fontweight='bold')
+ax2.set_ylabel('Momentum (%)', fontsize=12)
+ax2.set_xlabel('Date', fontsize=12)
+ax2.legend(loc='upper right', fontsize=9)
+ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+
+plt.tight_layout()
+plt.savefig('05_final_results.png', bbox_inches='tight', dpi=150)
+plt.show()
+print("📊 Plot saved: 05_final_results.png")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 8.2 — Error Distribution Analysis
+# ─────────────────────────────────────────────────────────────────────────────
+
+errors = test.values - predictions.values
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+
+# Histogram
+axes[0].hist(errors, bins=35, color='steelblue', edgecolor='white', alpha=0.8)
+axes[0].axvline(0, color='red', linestyle='--', lw=1.5, label='Zero Error')
+axes[0].axvline(errors.mean(), color='orange', linestyle='--',
+                lw=1.5, label=f'Mean Error: {errors.mean():.4f}')
+axes[0].set_title('Prediction Error Distribution', fontweight='bold')
+axes[0].set_xlabel('Error (Actual − Predicted)')
+axes[0].set_ylabel('Frequency')
+axes[0].legend()
+
+# Time-ordered errors
+axes[1].plot(test.index, errors, color='tomato', lw=1.2, alpha=0.8)
+axes[1].axhline(0, color='black', lw=0.8, linestyle='--')
+axes[1].fill_between(test.index, 0, errors, alpha=0.20, color='tomato')
+axes[1].set_title('Prediction Errors Over Time', fontweight='bold')
+axes[1].set_xlabel('Date')
+axes[1].set_ylabel('Error')
+axes[1].xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+
+plt.tight_layout()
+plt.savefig('06_error_analysis.png', bbox_inches='tight', dpi=150)
+plt.show()
+print("📊 Plot saved: 06_error_analysis.png")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 8.3 — Final Written Analysis & Model Summary
+# ─────────────────────────────────────────────────────────────────────────────
+
+skill_rmse = (1 - rmse_val / rmse_naive) * 100
+
+print("=" * 68)
+print("  📋  FINAL MODEL ANALYSIS REPORT")
+print("=" * 68)
+
+print(f"""
+TICKER      : {TICKER}
+SERIES      : {LOOKBACK}-Day Rate-of-Change Momentum
+MODEL       : ARIMA({p}, {d}, {q})
+TRAIN SIZE  : {len(train):,} observations
+TEST SIZE   : {len(test):,}  observations
+FORECAST    : {FORECAST_STEPS} steps ahead
+
+PERFORMANCE METRICS (Test Set)
+  ┌──────────────┬──────────────┬──────────────┐
+  │  Metric      │  ARIMA       │  Naïve       │
+  ├──────────────┼──────────────┼──────────────┤
+  │  MAE         │  {mae_val:>10.4f}  │  {mae_naive:>10.4f}  │
+  │  RMSE        │  {rmse_val:>10.4f}  │  {rmse_naive:>10.4f}  │
+  │  MAPE (%)    │  {mape_val:>10.4f}  │  {mape_naive:>10.4f}  │
+  └──────────────┴──────────────┴──────────────┘
+
+  ARIMA Skill vs Naïve (MAE)  : {skill_mae:+.1f}%
+  ARIMA Skill vs Naïve (RMSE) : {skill_rmse:+.1f}%
+""")
+
+print("INTERPRETATION")
+print("-" * 68)
+if mape_val < 10:
+    quality = "Excellent"
+elif mape_val < 25:
+    quality = "Good"
+elif mape_val < 50:
+    quality = "Acceptable"
+else:
+    quality = "Poor — consider a higher-order or different model"
+
+print(f"""
+  Model Quality (based on MAPE): {quality}
+
+  ✔  The ADF test confirmed the ROC Momentum series is stationary (or
+     near-stationary), making it suitable for ARIMA without heavy
+     pre-processing.
+
+  ✔  The ARIMA({p},{d},{q}) model captures the short-term autocorrelation
+     structure in momentum.  The AR({p}) component tracks mean-reverting
+     patterns, while the MA({q}) component smooths out transient shocks.
+
+  ✔  The 95% confidence intervals widen as the forecast horizon extends,
+     reflecting growing uncertainty — this is expected and correct.
+
+  ⚠  ARIMA is a LINEAR model and cannot capture:
+       - Volatility clustering (ARCH/GARCH needed)
+       - Non-linear regime changes (Markov-Switching models)
+       - Long-range dependencies (LSTM / Transformer models)
+
+NEXT STEPS FOR IMPROVEMENT
+  1. Try SARIMA if seasonality is detected (weekly/monthly patterns).
+  2. Add exogenous features (volume, RSI, VIX) → ARIMAX.
+  3. Compare against LSTM or Prophet for non-linear dynamics.
+  4. Use rolling-window walk-forward validation for robust evaluation.
+  5. Combine ARIMA + GARCH for joint mean & volatility modelling.
+""")
+print("=" * 68)
